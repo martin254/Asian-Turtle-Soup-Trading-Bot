@@ -1,4 +1,5 @@
-![ICTDayTrading](https://github.com/user-attachments/assets/6a78e903-5969-4945-bdb4-e860df967c86)
+
+![Screenshot 2025-02-05 214746](https://github.com/user-attachments/assets/3945da6e-8bb3-4bc9-b574-47eb6bf34ad7)
 # Asian-Turtle-Soup-Trading-Bot
 Algorithmic implementation of ICT (Inner Circle Trader) concepts for Forex day trading, designed for the QuantConnect platform.This bot focuses on Asian session range analysis, order block detection, and Turtle Soup entries with strict risk management.
 
