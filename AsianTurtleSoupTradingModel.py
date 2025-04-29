@@ -1,277 +1,152 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
+from collections import deque
 from clr import AddReference
 AddReference("System")
 AddReference("QuantConnect.Algorithm")
 AddReference("QuantConnect.Indicators")
 AddReference("QuantConnect.Common")
 
-from System import *
-from QuantConnect import *
-from QuantConnect.Algorithm import *
-from QuantConnect.Indicators import *
+from QuantConnect import Resolution, Market
+from QuantConnect.Algorithm import QCAlgorithm
 from QuantConnect.Data.Market import TradeBar
-import decimal
-import math
 
 class ICTDayTradingAlgorithm(QCAlgorithm):
     def Initialize(self):
-        self.SetCash(100000)
+        self.SetCash(100_000)
         self.SetStartDate(2023, 1, 1)
         self.SetEndDate(2024, 6, 30)
-        
-        # Add different timeframes for market structure
+
+        # subscribe once, then consolidate
         self.symbol = self.AddForex("EURUSD", Resolution.Minute, Market.Oanda).Symbol
-        self.symbol_4h = self.AddForex("EURUSD", Resolution.Hour, Market.Oanda).Symbol
-        
-        # Trading parameters
-        self.risk_percent = 0.01  # 1% risk per trade
-        self.reward_ratio = 2     # 1:2 risk/reward ratio
-        self.min_stop_distance = 0.0005  # 5 pips minimum stop
-        self.max_pos_size = 100000  # Maximum position size
-        
-        # ICT concepts parameters
-        self.breach_threshold = 0.0001  # 1 pip breach
-        self.rejection_threshold = 0.00005  # 0.5 pip rejection
-        self.max_breach_time = timedelta(minutes=30)
-        self.max_rejection_wait = timedelta(minutes=15)
-        self.orderblock_lookback = 20  # Bars to look back for order blocks
-        
-        # Session times (UTC)
-        self.asian_session_start = 0
-        self.asian_session_end = 8
-        self.london_session_start = 7
-        self.ny_session_start = 13
-        
-        # Market structure indicators
-        self.ema200_1h = self.EMA("EURUSD", 200, Resolution.Hour)
-        self.ema50_1h = self.EMA("EURUSD", 50, Resolution.Hour)
-        self.atr = self.ATR("EURUSD", 14, Resolution.Hour)
-        
-        # Order blocks tracking
-        self.bearish_ob = None
-        self.bullish_ob = None
-        self.ob_threshold = 0.0010  # 10 pips for order block significance
-        
-        # Market structure variables
-        self.htf_trend = None
-        self.ltf_trend = None
-        self.recent_highs = []
-        self.recent_lows = []
-        self.max_structure_points = 5
-        
-        # Trading state
-        self.asian_high = 0
-        self.asian_low = float('inf')
-        self.asian_range_set = False
-        self.breach_start_time = None
-        self.breach_start_price = None
-        self.breach_direction = None
-        self.rejection_start_time = None
-        self.rejection_price = None
-        self.trade_placed = False
-        
-        self.Schedule.On(self.DateRules.EveryDay(), 
-                        self.TimeRules.At(0, 0), 
-                        self.ResetDailyVariables)
+
+        # consolidate to 1h & 4h bars
+        self.hour_bar = None
+        self.window_4h = deque(maxlen=20)
+        self.Consolidate(self.symbol, Resolution.Hour, self.OnHourBar)
+        self.Consolidate(self.symbol, Resolution.Hour * 4, lambda bar: setattr(self, 'hour_bar', bar))
+
+        # parameters
+        self.risk_pct = 0.01
+        self.rr = 2
+        self.min_stop = 0.0005
+        self.max_size = 100_000
+        self.breach_thr = 0.0001
+        self.ob_thr = 0.0010
+
+        # sessions (UTC)
+        self.sessions = dict(asian=(0, 8), london=(7, 13), ny=(13, 21))
+
+        # indicators on 1h
+        self.ema200 = self.EMA(self.symbol, 200, Resolution.Hour)
+        self.ema50  = self.EMA(self.symbol,  50, Resolution.Hour)
+        self.atr    = self.ATR(self.symbol,  14, Resolution.Hour)
+
+        # state
+        self.reset_daily()
+        self.high_swings = deque(maxlen=5)
+        self.low_swings  = deque(maxlen=5)
+
+        self.Schedule.On(self.DateRules.EveryDay(),
+                         self.TimeRules.At(0, 0),
+                         lambda: self.reset_daily())
+
+    def OnHourBar(self, bar: TradeBar):
+        # maintain rolling 20 bars for orderblocks
+        self.window_4h.append(bar)
 
     def OnData(self, data):
-        if not self.symbol in data or not self.ema200_1h.IsReady:
+        # guard
+        if not data.ContainsKey(self.symbol) or not self.ema200.IsReady: return
+
+        price = data[self.symbol].Close
+        now   = self.Time
+
+        # build HTF trend
+        htf = 'bullish' if self.ema50.Current.Value > self.ema200.Current.Value else 'bearish'
+
+        # track swings
+        if not self.high_swings or price > max(self.high_swings):
+            self.high_swings.append(price)
+        if not self.low_swings or price < min(self.low_swings):
+            self.low_swings.append(price)
+
+        # hourly OB only when we have ≥1 4h bar
+        if self.window_4h:
+            self.update_orderblocks(self.window_4h[-1])
+
+        # session logic
+        hour = now.hour
+        if not self.asian_set:
+            a_start, a_end = self.sessions['asian']
+            if hour < a_end:
+                self.asian_high = max(self.asian_high, price)
+                self.asian_low  = min(self.asian_low,  price)
+                return
+            self.asian_set = True
+
+        # state machine
+        if not self.breach_time:
+            if price > self.asian_high + self.breach_thr:
+                self.breach_time, self.breach_price, self.dir = now, price, 'high'
+            elif price < self.asian_low - self.breach_thr:
+                self.breach_time, self.breach_price, self.dir = now, price, 'low'
             return
 
-        # Update market structure
-        self.UpdateMarketStructure(data)
-        
-        # Update order blocks
-        if self.Time.minute == 0:  # Update order blocks hourly
-            self.UpdateOrderBlocks(data)
-
-        current_hour = self.Time.hour
-        current_price = data[self.symbol].Close
-
-        if not self.asian_range_set:
-            self.HandleAsianSession(current_hour, current_price)
-        else:
-            self.HandleTurtleSoup(current_hour, current_price, data)
-
-    # NEW METHOD ADDED TO FIX ERROR
-    def HandleAsianSession(self, current_hour, current_price):
-        """Tracks Asian session price range (00:00-08:00 UTC)"""
-        if current_hour < self.asian_session_end:
-            # Update session high/low
-            self.asian_high = max(self.asian_high, current_price)
-            self.asian_low = min(self.asian_low, current_price)
-            self.Debug(f"Asian session update - High: {self.asian_high}, Low: {self.asian_low}")
-        else:
-            # Finalize Asian session range
-            self.asian_range_set = True
-            self.Debug(f"Final Asian Range - High: {self.asian_high}, Low: {self.asian_low}")
-
-    def UpdateMarketStructure(self, data):
-        current_price = data[self.symbol].Close
-        
-        # Higher timeframe trend
-        if self.ema200_1h.IsReady and self.ema50_1h.IsReady:
-            if self.ema50_1h.Current.Value > self.ema200_1h.Current.Value:
-                self.htf_trend = 'bullish'
-            else:
-                self.htf_trend = 'bearish'
-        
-        # Track recent swing points
-        if len(self.recent_highs) > 0:
-            if current_price > max(self.recent_highs):
-                self.recent_highs.append(current_price)
-                if len(self.recent_highs) > self.max_structure_points:
-                    self.recent_highs.pop(0)
-                self.ltf_trend = 'bullish'
-        
-        if len(self.recent_lows) > 0:
-            if current_price < min(self.recent_lows):
-                self.recent_lows.append(current_price)
-                if len(self.recent_lows) > self.max_structure_points:
-                    self.recent_lows.pop(0)
-                self.ltf_trend = 'bearish'
-
-    def UpdateOrderBlocks(self, data):
-        if not data.ContainsKey(self.symbol): return
-        
-        current_price = data[self.symbol].Close
-        candle_height = data[self.symbol].High - data[self.symbol].Low
-        
-        # Identify bullish order block (strong rejection of lows)
-        if candle_height > self.ob_threshold and \
-           data[self.symbol].Close > data[self.symbol].Open and \
-           (self.bullish_ob is None or current_price < self.bullish_ob):
-            self.bullish_ob = data[self.symbol].Low
-            
-        # Identify bearish order block (strong rejection of highs)
-        if candle_height > self.ob_threshold and \
-           data[self.symbol].Close < data[self.symbol].Open and \
-           (self.bearish_ob is None or current_price > self.bearish_ob):
-            self.bearish_ob = data[self.symbol].High
-
-    def HandleTurtleSoup(self, current_hour, current_price, data):
-        if self.breach_start_time is None:
-            self.CheckForBreach(current_price)
-        elif self.rejection_start_time is None:
-            self.CheckForRejection(current_price)
-        elif not self.trade_placed and current_hour >= self.ny_session_start:
-            self.CheckForEntry(current_price, data)
-
-    def CheckForBreach(self, current_price):
-        if current_price > self.asian_high + self.breach_threshold:
-            self.breach_start_time = self.Time
-            self.breach_start_price = current_price
-            self.breach_direction = 'high'
-            self.Debug(f"High breach detected at {current_price}")
-        elif current_price < self.asian_low - self.breach_threshold:
-            self.breach_start_time = self.Time
-            self.breach_start_price = current_price
-            self.breach_direction = 'low'
-            self.Debug(f"Low breach detected at {current_price}")
-
-    def CheckForRejection(self, current_price):
-        breach_time_elapsed = self.Time - self.breach_start_time
-        
-        if breach_time_elapsed > self.max_breach_time:
-            self.Debug("Breach took too long, resetting")
-            self.breach_start_time = None
+        # breach happened → wait for rejection
+        if not self.reject_time:
+            if self.dir == 'high' and price < self.asian_high:
+                self.reject_time, self.reject_price = now, price
+            elif self.dir == 'low'  and price > self.asian_low:
+                self.reject_time, self.reject_price = now, price
+            # timeout breach
+            if now - self.breach_time > timedelta(minutes=30):
+                self.breach_time = None
             return
-            
-        if self.breach_direction == 'high' and current_price < self.asian_high:
-            self.rejection_start_time = self.Time
-            self.rejection_price = current_price
-        elif self.breach_direction == 'low' and current_price > self.asian_low:
-            self.rejection_start_time = self.Time
-            self.rejection_price = current_price
 
-    def CheckForEntry(self, current_price, data):
-        if not self.ValidateTradeSetup(current_price):
-            return
-            
-        account_value = self.Portfolio.TotalPortfolioValue
-        risk_amount = account_value * self.risk_percent
-        
-        try:
-            if self.breach_direction == 'high' and self.htf_trend == 'bearish':
-                self.PlaceShortTrade(current_price, risk_amount)
-            elif self.breach_direction == 'low' and self.htf_trend == 'bullish':
-                self.PlaceLongTrade(current_price, risk_amount)
-                
-        except Exception as e:
-            self.Debug(f"Error placing trade: {str(e)}")
+        # rejection happened → enter only in NY session start
+        if not self.trade and hour >= self.sessions['ny'][0]:
+            if htf.startswith(self.dir == 'low' and 'bull' or 'bear'):
+                self.enter_trade(price)
+    
+    def update_orderblocks(self, bar: TradeBar):
+        rng = bar.High - bar.Low
+        if rng < self.ob_thr: return
+        if bar.Close > bar.Open and (not hasattr(self, 'bull_ob') or bar.Low < self.bull_ob):
+            self.bull_ob = bar.Low
+        if bar.Close < bar.Open and (not hasattr(self, 'bear_ob') or bar.High > self.bear_ob):
+            self.bear_ob = bar.High
 
-    def ValidateTradeSetup(self, current_price):
-        if self.Portfolio[self.symbol].Invested:
-            return False
-            
-        # Check alignment with HTF trend
-        if self.breach_direction == 'high' and self.htf_trend != 'bearish':
-            return False
-        if self.breach_direction == 'low' and self.htf_trend != 'bullish':
-            return False
-            
-        # Check order block alignment
-        if self.breach_direction == 'high' and self.bearish_ob:
-            if current_price > self.bearish_ob:
-                return False
-        if self.breach_direction == 'low' and self.bullish_ob:
-            if current_price < self.bullish_ob:
-                return False
-                
-        return True
+    def enter_trade(self, price):
+        # no existing position
+        if self.Portfolio[self.symbol].Invested: return
 
-    def PlaceLongTrade(self, current_price, risk_amount):
-        stop_loss = min(self.breach_start_price - self.min_stop_distance, 
-                       current_price - self.atr.Current.Value)
-        position_size = self.CalculatePositionSize(risk_amount, current_price, stop_loss)
-        
-        if position_size > 0:
-            position_size = min(position_size, self.max_pos_size)
-            take_profit = current_price + (current_price - stop_loss) * self.reward_ratio
-            
-            self.MarketOrder(self.symbol, position_size)
-            self.StopMarketOrder(self.symbol, -position_size, stop_loss)
-            self.LimitOrder(self.symbol, -position_size, take_profit)
-            self.trade_placed = True
+        # validate OB alignment
+        if self.dir=='high' and getattr(self, 'bear_ob', float('inf')) < price: return
+        if self.dir=='low'  and getattr(self, 'bull_ob',      0) > price: return
 
-    def PlaceShortTrade(self, current_price, risk_amount):
-        stop_loss = max(self.breach_start_price + self.min_stop_distance,
-                       current_price + self.atr.Current.Value)
-        position_size = self.CalculatePositionSize(risk_amount, current_price, stop_loss)
-        
-        if position_size > 0:
-            position_size = min(position_size, self.max_pos_size)
-            take_profit = current_price - (stop_loss - current_price) * self.reward_ratio
-            
-            self.MarketOrder(self.symbol, -position_size)
-            self.StopMarketOrder(self.symbol, position_size, stop_loss)
-            self.LimitOrder(self.symbol, position_size, take_profit)
-            self.trade_placed = True
+        # risk & size
+        equity = self.Portfolio.TotalPortfolioValue
+        risk_am = equity * self.risk_pct
+        sl = (self.dir=='high'
+              and min(self.breach_price - self.min_stop, price - self.atr.Current.Value)
+              or max(self.breach_price + self.min_stop, price + self.atr.Current.Value))
+        pips = abs(price - sl) / 0.0001
+        size = min(self.max_size, math.floor((risk_am / pips) / 0.0001) / 100)
 
-    def CalculatePositionSize(self, risk_amount, entry, stop_loss):
-        pip_value = 0.0001
-        pips_risked = abs(entry - stop_loss) / pip_value
-        
-        if pips_risked <= 0:
-            return 0
-            
-        # Calculate standard lot size based on risk
-        position_size = (risk_amount / pips_risked) / pip_value
-        
-        # Round down to 2 decimal places for micro lots
-        position_size = math.floor(position_size * 100) / 100
-        
-        return position_size
+        if size <= 0: return
 
-    def ResetDailyVariables(self):
-        """Resets daily trading variables at midnight UTC"""
+        tp = price + (price - sl) * (self.rr * (1 if self.dir=='low' else -1))
+        qty = size * (1 if self.dir=='low' else -1)
+
+        self.MarketOrder(self.symbol,     qty)
+        self.StopMarketOrder(self.symbol, -qty, sl)
+        self.LimitOrder(self.symbol,     -qty, tp)
+        self.trade = True
+
+    def reset_daily(self):
         self.asian_high = 0
-        self.asian_low = float('inf')
-        self.asian_range_set = False
-        self.breach_start_time = None
-        self.breach_start_price = None
-        self.breach_direction = None
-        self.rejection_start_time = None
-        self.rejection_price = None
-        self.trade_placed = False
-        self.Debug(f"{self.Time} - Daily variables reset")
+        self.asian_low  = float('inf')
+        self.asian_set  = False
+        self.breach_time = None
+        self.reject_time = None
+        self.trade      = False
